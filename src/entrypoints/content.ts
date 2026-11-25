@@ -1,9 +1,9 @@
 import {
   applyTextEdits,
-  suggestionsBySentence,
+  suggestionsByParagraph,
   suggestionsOverlap,
-  type SentenceSuggestions,
-} from "@/lib/ai/sentence-suggestions";
+  type ParagraphSuggestions,
+} from "@/lib/ai/paragraph-suggestions";
 import { settingsStorage } from "@/lib/storage";
 import {
   debounce,
@@ -276,7 +276,7 @@ export default defineContentScript({
         inset: -3px -1px -4px;
       }
 
-      .tc-sentence-marker {
+      .tc-paragraph-marker {
         position: fixed;
         display: grid;
         place-items: center;
@@ -287,16 +287,21 @@ export default defineContentScript({
         border-radius: 4px;
         background: #eff6ff;
         font-size: 11px;
+        line-height: 1;
+        transform: translateY(-50%);
         cursor: pointer;
         pointer-events: auto;
       }
 
-      .tc-sentence-marker:hover {
+      .tc-paragraph-marker:hover {
         background: #dbeafe;
       }
 
-      .tc-sentence-preview {
+      .tc-paragraph-preview {
         margin: 8px 0 12px;
+        max-height: min(34vh, 240px);
+        overflow: auto;
+        overflow-wrap: anywhere;
         white-space: pre-wrap;
       }
 
@@ -1029,7 +1034,7 @@ export default defineContentScript({
     // Inline popover (shown on underline click)
     let currentPopover: HTMLDivElement | null = null;
 
-    function openPopover(anchorRect: DOMRect): HTMLDivElement {
+    function openPopover(anchorRect: DOMRect, preferredHeight = 180): HTMLDivElement {
       hidePopover();
       hideSuggestionPanel();
 
@@ -1043,7 +1048,7 @@ export default defineContentScript({
       const viewportHeight = window.innerHeight;
       const viewportWidth = window.innerWidth;
       const spaceBelow = viewportHeight - anchorRect.bottom;
-      const showAbove = spaceBelow < 180;
+      const showAbove = spaceBelow < preferredHeight && anchorRect.top > spaceBelow;
 
       let left = anchorRect.left;
       if (left + 300 > viewportWidth) left = viewportWidth - 310;
@@ -1119,23 +1124,23 @@ export default defineContentScript({
 
     }
 
-    function showSentencePopover(sentence: SentenceSuggestions, anchorRect: DOMRect) {
+    function showParagraphPopover(paragraph: ParagraphSuggestions, anchorRect: DOMRect) {
       const text = checkedText;
       if (text === null) return;
 
-      const preview = applyTextEdits(text.slice(sentence.startIndex, sentence.endIndex), sentence.edits, sentence.startIndex);
-      const popover = openPopover(anchorRect);
+      const preview = applyTextEdits(text.slice(paragraph.startIndex, paragraph.endIndex), paragraph.edits, paragraph.startIndex);
+      const popover = openPopover(anchorRect, Math.min(window.innerHeight * 0.34, 240) + 96);
       popover.innerHTML = `
-        <div class="tc-popover-header"><strong>Corrected sentence</strong></div>
-        <p class="tc-sentence-preview">${escapeHtml(preview)}</p>
-        ${sentence.hasConflicts ? '<p class="tc-explanation">Overlapping alternatives can be reviewed individually.</p>' : ''}
+        <div class="tc-popover-header"><strong>Corrected paragraph</strong></div>
+        <p class="tc-paragraph-preview">${escapeHtml(preview)}</p>
+        ${paragraph.hasConflicts ? '<p class="tc-explanation">Overlapping alternatives can be reviewed individually.</p>' : ''}
         <div class="tc-popover-actions">
-          <button class="tc-btn tc-btn-primary" data-action="apply-sentence">Apply all (${sentence.edits.length})</button>
+          <button class="tc-btn tc-btn-primary" data-action="apply-paragraph">Apply all (${paragraph.edits.length})</button>
         </div>
       `;
-      popover.querySelector('[data-action="apply-sentence"]')?.addEventListener("click", (event) => {
+      popover.querySelector('[data-action="apply-paragraph"]')?.addEventListener("click", (event) => {
         event.stopPropagation();
-        if (applySuggestions(sentence.edits)) {
+        if (applySuggestions(paragraph.edits)) {
           hidePopover();
           updateStatusAfterChange();
         }
@@ -1307,7 +1312,7 @@ export default defineContentScript({
 
       for (const underline of underlineTargets.keys()) underline.remove();
       underlineTargets.clear();
-      shadow.querySelectorAll(".tc-sentence-marker").forEach((marker) => marker.remove());
+      shadow.querySelectorAll(".tc-paragraph-marker").forEach((marker) => marker.remove());
 
       const element = activeElement;
       if (!element || currentSuggestions.length === 0) return;
@@ -1354,21 +1359,23 @@ export default defineContentScript({
         });
       });
 
-      for (const sentence of suggestionsBySentence(text, currentSuggestions)) {
-        const rect = getRects(sentence.endIndex - 1, sentence.endIndex).at(-1);
+      for (const paragraph of suggestionsByParagraph(text, currentSuggestions)) {
+        const rect = getRects(paragraph.endIndex - 1, paragraph.endIndex).at(-1);
         if (!rect || rect.height <= 0) continue;
         const marker = document.createElement("button");
         marker.type = "button";
-        marker.className = "tc-sentence-marker";
+        marker.className = "tc-paragraph-marker";
         marker.textContent = "✏️";
-        marker.setAttribute("aria-label", "Preview sentence corrections");
-        marker.title = "Preview sentence corrections";
-        marker.style.left = `${Math.max(0, Math.min(rect.right + 3, window.innerWidth - 18))}px`;
-        marker.style.top = `${rect.bottom - 12}px`;
+        marker.setAttribute("aria-label", "Preview paragraph corrections");
+        marker.title = "Preview paragraph corrections";
+        const fitsAfterText = rect.right + 21 <= window.innerWidth;
+        const left = fitsAfterText ? rect.right + 3 : Math.min(rect.right, window.innerWidth) - 18;
+        marker.style.left = `${Math.max(0, left)}px`;
+        marker.style.top = `${fitsAfterText ? rect.top + rect.height / 2 : rect.bottom + 11}px`;
         marker.addEventListener("mousedown", (event) => event.preventDefault());
         marker.addEventListener("click", (event) => {
           event.stopPropagation();
-          showSentencePopover(sentence, marker.getBoundingClientRect());
+          showParagraphPopover(paragraph, marker.getBoundingClientRect());
         });
         shadow.appendChild(marker);
       }
