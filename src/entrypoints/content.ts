@@ -1,3 +1,9 @@
+import {
+  applyTextEdits,
+  suggestionsBySentence,
+  suggestionsOverlap,
+  type SentenceSuggestions,
+} from "@/lib/ai/sentence-suggestions";
 import { settingsStorage } from "@/lib/storage";
 import {
   debounce,
@@ -33,7 +39,6 @@ export default defineContentScript({
     let pendingFieldCheck: { element: HTMLElement; text: string; force: boolean } | null = null;
     const minTextLength = 3;
     let unwatchSettings: (() => void) | null = null;
-    let popoverCloseTimeout: ReturnType<typeof setTimeout> | null = null;
 
     // Load initial settings
     try {
@@ -269,6 +274,30 @@ export default defineContentScript({
         content: "";
         position: absolute;
         inset: -3px -1px -4px;
+      }
+
+      .tc-sentence-marker {
+        position: fixed;
+        display: grid;
+        place-items: center;
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        border: 1px solid #bfdbfe;
+        border-radius: 4px;
+        background: #eff6ff;
+        font-size: 11px;
+        cursor: pointer;
+        pointer-events: auto;
+      }
+
+      .tc-sentence-marker:hover {
+        background: #dbeafe;
+      }
+
+      .tc-sentence-preview {
+        margin: 8px 0 12px;
+        white-space: pre-wrap;
       }
 
       .tc-underline:hover {
@@ -1000,7 +1029,7 @@ export default defineContentScript({
     // Inline popover (shown on underline click)
     let currentPopover: HTMLDivElement | null = null;
 
-    function showPopover(suggestion: GrammarSuggestion, anchorRect: DOMRect) {
+    function openPopover(anchorRect: DOMRect): HTMLDivElement {
       hidePopover();
       hideSuggestionPanel();
 
@@ -1029,10 +1058,21 @@ export default defineContentScript({
         currentPopover.style.top = `${anchorRect.bottom + 8}px`;
       }
 
+      currentPopover.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      shadow.appendChild(currentPopover);
+      document.addEventListener("mousedown", handlePopoverOutsideClick, true);
+      return currentPopover;
+    }
+
+    function showPopover(suggestion: GrammarSuggestion, anchorRect: DOMRect) {
+      const popover = openPopover(anchorRect);
       const color = getSuggestionColor(suggestion.type);
       const label = getSuggestionLabel(suggestion.type);
 
-      currentPopover.innerHTML = `
+      popover.innerHTML = `
         <div class="tc-popover-header">
           <span class="tc-badge" style="background: ${color}">${label}</span>
           <span class="tc-original">${escapeHtml(suggestion.original || "Insert")}</span>
@@ -1053,12 +1093,7 @@ export default defineContentScript({
         </div>
       `;
 
-      currentPopover.addEventListener("mousedown", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-      });
-
-      currentPopover.addEventListener("click", async (e) => {
+      popover.addEventListener("click", async (e) => {
         e.preventDefault();
         e.stopPropagation();
 
@@ -1082,13 +1117,29 @@ export default defineContentScript({
         }
       });
 
-      shadow.appendChild(currentPopover);
+    }
 
-      // Close on outside click - with delay to prevent immediate close
-      if (popoverCloseTimeout) clearTimeout(popoverCloseTimeout);
-      popoverCloseTimeout = setTimeout(() => {
-        document.addEventListener("mousedown", handlePopoverOutsideClick, true);
-      }, 100);
+    function showSentencePopover(sentence: SentenceSuggestions, anchorRect: DOMRect) {
+      const text = checkedText;
+      if (text === null) return;
+
+      const preview = applyTextEdits(text.slice(sentence.startIndex, sentence.endIndex), sentence.edits, sentence.startIndex);
+      const popover = openPopover(anchorRect);
+      popover.innerHTML = `
+        <div class="tc-popover-header"><strong>Corrected sentence</strong></div>
+        <p class="tc-sentence-preview">${escapeHtml(preview)}</p>
+        ${sentence.hasConflicts ? '<p class="tc-explanation">Overlapping alternatives can be reviewed individually.</p>' : ''}
+        <div class="tc-popover-actions">
+          <button class="tc-btn tc-btn-primary" data-action="apply-sentence">Apply all (${sentence.edits.length})</button>
+        </div>
+      `;
+      popover.querySelector('[data-action="apply-sentence"]')?.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (applySuggestions(sentence.edits)) {
+          hidePopover();
+          updateStatusAfterChange();
+        }
+      });
     }
 
     function handlePopoverOutsideClick(e: MouseEvent) {
@@ -1115,10 +1166,6 @@ export default defineContentScript({
     }
 
     function hidePopover() {
-      if (popoverCloseTimeout) {
-        clearTimeout(popoverCloseTimeout);
-        popoverCloseTimeout = null;
-      }
       document.removeEventListener(
         "mousedown",
         handlePopoverOutsideClick,
@@ -1147,75 +1194,93 @@ export default defineContentScript({
     }
 
     function applySuggestion(suggestion: GrammarSuggestion): boolean {
-      const element = activeElement;
-      if (!element) return false;
+      return applySuggestions([suggestion]);
+    }
 
-      const { startIndex, endIndex, original, replacement } = suggestion;
+    function applySuggestions(edits: GrammarSuggestion[]): boolean {
+      const element = activeElement;
+      if (!element || !edits.length) return false;
+
       const text = getTextFromElement(element);
-      if (text !== checkedText || text.slice(startIndex, endIndex) !== original) {
+      if (text !== checkedText || edits.some(({ startIndex, endIndex, original }) =>
+        text.slice(startIndex, endIndex) !== original
+      )) {
         cleanup();
         queueFieldCheck(element, true);
         return false;
       }
 
-      const newText = text.slice(0, startIndex) + replacement + text.slice(endIndex);
+      const newText = applyTextEdits(text, edits);
       isApplyingSuggestion = true;
       try {
         if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
           setTextInElement(element, newText);
-        } else {
-          const range = mapEditorRanges(element, text)?.(startIndex, endIndex);
-          const selection = window.getSelection();
-          if (!element.isContentEditable || !range || !selection) return false;
-
-          const textNode = range.startContainer as Text;
-          const offset = range.startOffset;
-          const inputType = replacement ? "insertReplacementText" : "deleteContent";
-          const event = { inputType, data: replacement, bubbles: true, composed: true };
-          const targetRange = new StaticRange({
-            startContainer: range.startContainer,
-            startOffset: range.startOffset,
-            endContainer: range.endContainer,
-            endOffset: range.endOffset,
-          });
-
-          element.focus();
-          if (!element.dispatchEvent(new InputEvent("beforeinput", {
-            ...event,
-            cancelable: true,
-            targetRanges: [targetRange],
-          }))) return false;
-          if (!element.contains(textNode) || getTextFromElement(element) !== text) return false;
-
-          if (range.startContainer === range.endContainer) {
-            textNode.replaceData(offset, range.endOffset - offset, replacement);
-          } else {
-            range.deleteContents();
-            textNode.insertData(offset, replacement);
-          }
-          selection.collapse(textNode, offset + replacement.length);
-          element.dispatchEvent(new InputEvent("input", event));
+        } else if (!applyEditorEdits(element, text, edits)) {
+          return false;
         }
       } finally {
         isApplyingSuggestion = false;
       }
 
-      const lengthDiff = replacement.length - original.length;
+      const appliedIds = new Set(edits.map((edit) => edit.id));
       checkedText = getTextFromElement(element);
       currentSuggestions = checkedText === newText
         ? currentSuggestions.flatMap((item) => {
-            if (item.id === suggestion.id) return [];
-            if (item.endIndex <= startIndex) return [item];
-            if (item.startIndex < endIndex) return [];
-            return [{
-              ...item,
-              startIndex: item.startIndex + lengthDiff,
-              endIndex: item.endIndex + lengthDiff,
-            }];
+            if (appliedIds.has(item.id) || edits.some((edit) => suggestionsOverlap(edit, item))) return [];
+            const delta = edits.reduce((shift, edit) => edit.endIndex <= item.startIndex
+              ? shift + edit.replacement.length - edit.original.length
+              : shift, 0);
+            return [{ ...item, startIndex: item.startIndex + delta, endIndex: item.endIndex + delta }];
           })
         : [];
 
-      browser.runtime.sendMessage({ type: "CORRECTION_APPLIED" }).catch(() => {});
+      browser.runtime.sendMessage({ type: "CORRECTION_APPLIED", payload: { count: edits.length } }).catch(() => {});
+      return true;
+    }
+
+    function applyEditorEdits(element: HTMLElement, text: string, edits: GrammarSuggestion[]): boolean {
+      const mapRange = mapEditorRanges(element, text);
+      const selection = window.getSelection();
+      if (!element.isContentEditable || !mapRange || !selection) return false;
+
+      const changes = [];
+      for (const { startIndex, endIndex, replacement } of edits) {
+        const range = mapRange(startIndex, endIndex);
+        if (!range) return false;
+        changes.push({ range, replacement });
+      }
+
+      const event = {
+        inputType: edits.length === 1 && !edits[0].replacement ? "deleteContent" : "insertReplacementText",
+        data: edits.length === 1 ? edits[0].replacement : null,
+        bubbles: true,
+        composed: true,
+      };
+      const targetRanges = changes.map(({ range }) => new StaticRange({
+        startContainer: range.startContainer,
+        startOffset: range.startOffset,
+        endContainer: range.endContainer,
+        endOffset: range.endOffset,
+      }));
+
+      element.focus();
+      if (!element.dispatchEvent(new InputEvent("beforeinput", { ...event, cancelable: true, targetRanges }))) return false;
+      if (getTextFromElement(element) !== text || targetRanges.some((range) =>
+        !element.contains(range.startContainer) || !element.contains(range.endContainer)
+      )) return false;
+
+      for (const { range, replacement } of changes.reverse()) {
+        const textNode = range.startContainer as Text;
+        const offset = range.startOffset;
+        if (range.startContainer === range.endContainer) {
+          textNode.replaceData(offset, range.endOffset - offset, replacement);
+        } else {
+          range.deleteContents();
+          textNode.insertData(offset, replacement);
+        }
+        selection.collapse(textNode, offset + replacement.length);
+      }
+      element.dispatchEvent(new InputEvent("input", event));
       return true;
     }
 
@@ -1242,6 +1307,7 @@ export default defineContentScript({
 
       for (const underline of underlineTargets.keys()) underline.remove();
       underlineTargets.clear();
+      shadow.querySelectorAll(".tc-sentence-marker").forEach((marker) => marker.remove());
 
       const element = activeElement;
       if (!element || currentSuggestions.length === 0) return;
@@ -1249,14 +1315,15 @@ export default defineContentScript({
       const text = getTextFromElement(element);
       if (text !== checkedText) return;
       const editorRange = standardField ? null : mapEditorRanges(element, text);
+      const getRects = (start: number, end: number) => standardField
+        ? getTextareaCharacterRects(element, start, end)
+        : Array.from(editorRange?.(start, end)?.getClientRects() ?? []);
 
       currentSuggestions.forEach((suggestion) => {
         const { startIndex, endIndex, original } = suggestion;
         if (text.slice(startIndex, endIndex) !== original) return;
 
-        const rects = standardField
-          ? getTextareaCharacterRects(element, startIndex, endIndex)
-          : Array.from(editorRange?.(startIndex, endIndex)?.getClientRects() ?? []);
+        const rects = getRects(startIndex, endIndex);
 
         const insertion = startIndex === endIndex;
         rects.forEach((rect) => {
@@ -1286,26 +1353,61 @@ export default defineContentScript({
           underlineTargets.set(underline, { suggestion, rect });
         });
       });
+
+      for (const sentence of suggestionsBySentence(text, currentSuggestions)) {
+        const rect = getRects(sentence.endIndex - 1, sentence.endIndex).at(-1);
+        if (!rect || rect.height <= 0) continue;
+        const marker = document.createElement("button");
+        marker.type = "button";
+        marker.className = "tc-sentence-marker";
+        marker.textContent = "✏️";
+        marker.setAttribute("aria-label", "Preview sentence corrections");
+        marker.title = "Preview sentence corrections";
+        marker.style.left = `${Math.max(0, Math.min(rect.right + 3, window.innerWidth - 18))}px`;
+        marker.style.top = `${rect.bottom - 12}px`;
+        marker.addEventListener("mousedown", (event) => event.preventDefault());
+        marker.addEventListener("click", (event) => {
+          event.stopPropagation();
+          showSentencePopover(sentence, marker.getBoundingClientRect());
+        });
+        shadow.appendChild(marker);
+      }
     }
 
-    function handleSuggestionContextMenu(event: MouseEvent) {
+    function suggestionAtPointer(event: MouseEvent) {
       const element = activeElement;
       if (!element || underlineTargets.size === 0 || getTextFromElement(element) !== checkedText) return;
 
       const path = event.composedPath();
       const inEditor = path.includes(element);
       const { clientX, clientY } = event;
-      for (const [underline, { suggestion, rect }] of underlineTargets) {
+      for (const [underline, target] of underlineTargets) {
+        const { suggestion, rect } = target;
         const horizontalPadding = suggestion.startIndex === suggestion.endIndex ? 4 : 0;
         const overText = inEditor && clientX >= rect.left - horizontalPadding &&
           clientX <= rect.right + horizontalPadding && clientY >= rect.top && clientY <= rect.bottom;
-        if (path.includes(underline) || overText) {
-          event.preventDefault();
-          event.stopPropagation();
-          showPopover(suggestion, rect);
-          return;
-        }
+        if (path.includes(underline) || overText) return target;
       }
+    }
+
+    function handleSuggestionContextMenu(event: MouseEvent) {
+      const target = suggestionAtPointer(event);
+      if (!target) return;
+      event.preventDefault();
+      event.stopPropagation();
+      showPopover(target.suggestion, target.rect);
+    }
+
+    function handleSuggestionClick(event: MouseEvent) {
+      if (event.button !== 0 || event.detail !== 1 || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+      const element = activeElement;
+      if (!element || !event.composedPath().includes(element)) return;
+      const selectionIsCollapsed = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
+        ? element.selectionStart === element.selectionEnd
+        : window.getSelection()?.isCollapsed !== false;
+      if (!selectionIsCollapsed) return;
+      const target = suggestionAtPointer(event);
+      if (target) showPopover(target.suggestion, target.rect);
     }
 
     function queueFieldCheck(element: HTMLElement, force = false) {
@@ -1403,6 +1505,7 @@ export default defineContentScript({
 
     document.addEventListener("focusout", handleBlur, true);
     document.addEventListener("contextmenu", handleSuggestionContextMenu, true);
+    document.addEventListener("click", handleSuggestionClick, true);
 
     document.addEventListener("input", (event) => {
       if (event.target instanceof HTMLElement) handleInput(event.target);
@@ -1447,6 +1550,7 @@ export default defineContentScript({
 
     ctx.onInvalidated(() => {
       document.removeEventListener("contextmenu", handleSuggestionContextMenu, true);
+      document.removeEventListener("click", handleSuggestionClick, true);
       googleDocsHandler.stop();
       cleanup();
       if (unwatchSettings) unwatchSettings();

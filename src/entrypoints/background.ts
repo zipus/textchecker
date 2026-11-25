@@ -157,7 +157,8 @@ export default defineBackground(() => {
         }
 
         case 'CORRECTION_APPLIED': {
-          await incrementStats('correctionsApplied');
+          const count = (message.payload as { count?: number } | undefined)?.count;
+          await incrementStats('correctionsApplied', typeof count === 'number' && Number.isSafeInteger(count) && count > 0 ? count : 1);
           sendResponse({ success: true });
           break;
         }
