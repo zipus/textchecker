@@ -44,3 +44,67 @@ export function suggestionsByParagraph(text: string, suggestions: GrammarSuggest
 
   return paragraphs;
 }
+
+export function retainUnchangedSuggestions(
+  suggestions: GrammarSuggestion[],
+  previousText: string,
+  text: string,
+): GrammarSuggestion[] {
+  if (previousText === text || !suggestions.length) return suggestions;
+
+  let prefix = 0;
+  while (prefix < previousText.length && previousText[prefix] === text[prefix]) prefix++;
+
+  let previousEnd = previousText.length;
+  let end = text.length;
+  while (previousEnd > prefix && end > prefix && previousText[previousEnd - 1] === text[end - 1]) {
+    previousEnd--;
+    end--;
+  }
+
+  // Rich-text editors may change spaces in several places when applying an edit.
+  // If the visible characters match, their order gives us an unambiguous offset map.
+  const positions: number[] = [];
+  if (previousText.replace(/\s/g, '') === text.replace(/\s/g, '')) {
+    let target = 0;
+    for (const { index } of previousText.matchAll(/\S/g)) {
+      while (/\s/.test(text[target] ?? '')) target++;
+      positions[index] = target++;
+    }
+  }
+
+  const word = /[\p{L}\p{M}\p{N}]/u;
+  function joinsWord(at: number, newAt: number) {
+    return !word.test(previousText[at] ?? '') && word.test(text[newAt] ?? '');
+  }
+
+  return suggestions.flatMap((item) => {
+    const insertion = item.startIndex === item.endIndex;
+    let startIndex: number;
+    let endIndex: number;
+    if (insertion && item.startIndex >= prefix && item.startIndex <= previousEnd) {
+      const before = positions[item.startIndex - 1];
+      const after = positions[item.startIndex];
+      if (before === undefined && after === undefined) return [];
+      if (before !== undefined && after !== undefined && before + 1 !== after) return [];
+      startIndex = endIndex = after ?? before + 1;
+    } else if (item.endIndex <= prefix) {
+      ({ startIndex, endIndex } = item);
+    } else if (item.startIndex >= previousEnd) {
+      const offset = end - previousEnd;
+      startIndex = item.startIndex + offset;
+      endIndex = item.endIndex + offset;
+    } else {
+      startIndex = positions[item.startIndex];
+      endIndex = positions[item.endIndex - 1] + 1;
+    }
+
+    if (!Number.isInteger(startIndex) || !Number.isInteger(endIndex) ||
+        text.slice(startIndex, endIndex) !== item.original) return [];
+
+    if ((word.test(item.original[0] ?? '') && joinsWord(item.startIndex - 1, startIndex - 1)) ||
+        (word.test(item.original.at(-1) ?? '') && joinsWord(item.endIndex, endIndex))) return [];
+
+    return [{ ...item, startIndex, endIndex }];
+  });
+}

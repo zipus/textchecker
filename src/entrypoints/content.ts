@@ -1,5 +1,6 @@
 import {
   applyTextEdits,
+  retainUnchangedSuggestions,
   suggestionsByParagraph,
   suggestionsOverlap,
   type ParagraphSuggestions,
@@ -1228,16 +1229,16 @@ export default defineContentScript({
       }
 
       const appliedIds = new Set(edits.map((edit) => edit.id));
+      const remaining = currentSuggestions.flatMap((item) => {
+        if (appliedIds.has(item.id) || edits.some((edit) => suggestionsOverlap(edit, item))) return [];
+        const delta = edits.reduce((shift, edit) => edit.endIndex <= item.startIndex
+          ? shift + edit.replacement.length - edit.original.length
+          : shift, 0);
+        return [{ ...item, startIndex: item.startIndex + delta, endIndex: item.endIndex + delta }];
+      });
       checkedText = getTextFromElement(element);
-      currentSuggestions = checkedText === newText
-        ? currentSuggestions.flatMap((item) => {
-            if (appliedIds.has(item.id) || edits.some((edit) => suggestionsOverlap(edit, item))) return [];
-            const delta = edits.reduce((shift, edit) => edit.endIndex <= item.startIndex
-              ? shift + edit.replacement.length - edit.original.length
-              : shift, 0);
-            return [{ ...item, startIndex: item.startIndex + delta, endIndex: item.endIndex + delta }];
-          })
-        : [];
+      currentSuggestions = retainUnchangedSuggestions(remaining, newText, checkedText);
+      queueFieldCheck(element);
 
       browser.runtime.sendMessage({ type: "CORRECTION_APPLIED", payload: { count: edits.length } }).catch(() => {});
       return true;
@@ -1451,7 +1452,7 @@ export default defineContentScript({
       if (!isCurrent()) return;
 
       isChecking = true;
-      showStatusButton("loading");
+      if (!currentSuggestions.length) showStatusButton("loading");
 
       try {
         const result = await checkGrammarRequest(text, force);
@@ -1459,13 +1460,18 @@ export default defineContentScript({
           checkedText = text;
           reviewIncomplete = !!result.incomplete;
           currentSuggestions = result.suggestions;
-          renderUnderlines();
-          const count = currentSuggestions.length;
-          showStatusButton(count ? "errors" : result.incomplete ? "incomplete" : "clean", count);
+          hidePopover();
+          if (suggestionPanel) updatePanelAfterChange();
+          else updateStatusAfterChange();
         }
       } catch (error) {
         if (isCurrent()) {
-          showStatusButton("failed", 0, error instanceof Error ? error.message : "Could not check the text.");
+          const message = error instanceof Error ? error.message : "Could not check the text.";
+          if (currentSuggestions.length && statusButton) {
+            statusButton.title = message;
+          } else {
+            showStatusButton("failed", 0, message);
+          }
         }
       } finally {
         isChecking = false;
@@ -1491,8 +1497,27 @@ export default defineContentScript({
 
     function handleInput(element: HTMLElement) {
       if (isApplyingSuggestion || !settings.enabled || !isEditableElement(element)) return;
-      cleanup();
-      activeElement = element;
+      if (activeElement !== element) {
+        cleanup();
+        activeElement = element;
+      } else if (checkedText !== null) {
+        const text = getTextFromElement(element);
+        const previousText = checkedText;
+        currentSuggestions = retainUnchangedSuggestions(currentSuggestions, previousText, text);
+        checkedText = text;
+        if (text !== previousText) {
+          hidePopover();
+          if (suggestionPanel && currentSuggestions.length) {
+            updatePanelAfterChange();
+            queueFieldCheck(element);
+            return;
+          }
+          hideSuggestionPanel();
+          if (currentSuggestions.length) showStatusButton("errors", currentSuggestions.length);
+          else hideStatusButton();
+        }
+        renderUnderlines();
+      }
       queueFieldCheck(element);
     }
 
